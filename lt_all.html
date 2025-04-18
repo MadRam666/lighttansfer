@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <title>LightTransfer - Dateiübertragung via QR</title>
+  <style>
+    body {
+      margin: 0;
+      background: #111;
+      color: #fff;
+      font-family: sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 1em;
+    }
+    section {
+      background: #222;
+      border: 1px solid #444;
+      padding: 1em;
+      margin: 1em;
+      width: 100%;
+      max-width: 600px;
+    }
+    h2 {
+      margin-top: 0;
+    }
+    #qrcode, #recvProgress {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      margin-top: 1em;
+    }
+    #qrcode canvas {
+      background: white;
+      padding: 10px;
+    }
+    video {
+      width: 100%;
+      max-width: 300px;
+      border: 2px solid white;
+      margin-top: 1em;
+    }
+    label span {
+      font-weight: bold;
+    }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.1/build/qrcode.min.js"></script>
+  <script src="https://unpkg.com/@zxing/library@latest"></script>
+</head>
+<body>
+  <section>
+    <h2>Sender</h2>
+    <input type="file" id="fileInput" />
+    <br><br>
+    <label>Zeichen pro QR-Code: <span id="chunkSizeLabel">800</span></label><br>
+    <input type="range" id="chunkSizeRange" min="200" max="1200" step="100" value="800" oninput="document.getElementById('chunkSizeLabel').textContent = this.value">
+    <br><br>
+    <label>Fehlerkorrektur:</label>
+    <select id="eccLevel">
+      <option value="L">Low</option>
+      <option value="M" selected>Medium</option>
+      <option value="Q">Quartile</option>
+      <option value="H">High</option>
+    </select>
+    <label>QR-Größe:</label>
+    <select id="qrSize">
+      <option value="128">128px</option>
+      <option value="256" selected>256px</option>
+      <option value="384">384px</option>
+    </select>
+    <br><br>
+    <button onclick="startTransfer()">Start QR-Transfer</button>
+    <button onclick="resumeTransfer()">▶️ Fortsetzen</button>
+    <button onclick="pauseTransfer()">⏸️ Pause</button>
+    <div id="sendInfo"></div>
+    <div id="qrcode"></div>
+  </section>
+
+  <section>
+    <h2>Empfänger</h2>
+    <video id="video" autoplay></video>
+    <div id="recvInfo">Warte auf Startblock...</div>
+    <div id="recvProgress"></div>
+  </section>
+
+  <script>
+    let chunks = [], currentIndex = 0, intervalId = null, isPaused = true, meta = {}, qrData = [];
+
+    function splitData(str, size) {
+      const result = [];
+      for (let i = 0; i < str.length; i += size) {
+        result.push(str.slice(i, i + size));
+      }
+      return result;
+    }
+
+    function startTransfer() {
+      const file = document.getElementById('fileInput').files[0];
+      if (!file) return alert("Bitte Datei wählen");
+      const chunkSize = parseInt(document.getElementById('chunkSizeRange').value);
+      const reader = new FileReader();
+      reader.onload = () => {
+        const base64 = btoa(new Uint8Array(reader.result).reduce((d, b) => d + String.fromCharCode(b), ''));
+        chunks = splitData(base64, chunkSize);
+        meta = { type: "meta", magic: "LightTransferQR", name: file.name, mime: file.type, total: chunks.length, size: base64.length };
+        qrData = [meta, ...chunks.map((chunk, i) => ({ type: "data", i, data: chunk }))];
+        currentIndex = 0;
+        isPaused = true;
+        showQR(0);
+        document.getElementById('sendInfo').textContent = `Blöcke: ${chunks.length} (Chunkgröße: ${chunkSize} Zeichen)`;
+      };
+      reader.readAsArrayBuffer(file);
+    }
+
+    async function showQR(index) {
+      const container = document.getElementById('qrcode');
+      container.innerHTML = "";
+      const size = parseInt(document.getElementById('qrSize').value);
+      const opts = {
+        width: size,
+        margin: 2,
+        color: { dark: "#000", light: "#FFF" }
+      };
+      const canvas = document.createElement('canvas');
+      await QRCode.toCanvas(canvas, JSON.stringify(qrData[index]), opts);
+      container.appendChild(canvas);
+    }
+
+    function resumeTransfer() {
+      if (intervalId) clearInterval(intervalId);
+      isPaused = false;
+      intervalId = setInterval(() => {
+        if (isPaused || currentIndex >= qrData.length) return;
+        showQR(currentIndex);
+        currentIndex++;
+        if (currentIndex >= qrData.length) clearInterval(intervalId);
+      }, 1000);
+    }
+
+    function pauseTransfer() {
+      isPaused = true;
+      clearInterval(intervalId);
+    }
+
+    // Empfänger
+    const codeReader = new ZXing.BrowserQRCodeReader();
+    const receivedChunks = {};
+    let expectedChunks = null, filename = "", filetype = "", base64Size = 0, started = false;
+
+    function resetReceiverUI() {
+      document.getElementById('recvInfo').textContent = 'Warte auf Startblock...';
+      document.getElementById('recvProgress').innerHTML = '';
+      expectedChunks = null;
+      filename = "";
+      filetype = "";
+      base64Size = 0;
+      started = false;
+      for (const key in receivedChunks) delete receivedChunks[key];
+    }
+
+    codeReader.decodeFromVideoDevice(undefined, 'video', (result, err) => {
+      if (result) {
+        console.log('QR erkannt:', result.getText());
+        try {
+          const obj = JSON.parse(result.getText());
+          if (obj.type === "meta" && obj.magic === "LightTransferQR") {
+            resetReceiverUI();
+            filename = obj.name;
+            filetype = obj.mime;
+            expectedChunks = obj.total;
+            base64Size = obj.size;
+            started = true;
+            document.getElementById('recvInfo').textContent = `Startblock empfangen: ${filename} (${expectedChunks} Blöcke)`;
+            updateProgress();
+          } else if (obj.type === "data" && started && expectedChunks !== null) {
+            if (!(obj.i in receivedChunks)) receivedChunks[obj.i] = obj.data;
+            document.getElementById('recvInfo').textContent = `Empfange Block ${obj.i + 1} / ${expectedChunks}`;
+            updateProgress();
+            if (Object.keys(receivedChunks).length === expectedChunks) finishReception();
+          } else if (!started) {
+            document.getElementById('recvInfo').textContent = "Empfange Datenblock ohne Startblock – warte auf Header.";
+          }
+        } catch (e) {
+          document.getElementById('recvInfo').textContent = "Ungültiger QR-Code erkannt.";
+          console.error("Fehler beim QR-Code-Inhalt", e);
+        }
+      }
+    });
+
+    function updateProgress() {
+      const div = document.getElementById('recvProgress');
+      div.innerHTML = "";
+      if (expectedChunks === null) return;
+      for (let i = 0; i < expectedChunks; i++) {
+        const dot = document.createElement('span');
+        dot.textContent = i in receivedChunks ? "🟩" : "⬛";
+        div.appendChild(dot);
+      }
+    }
+
+    function finishReception() {
+      const data = Object.keys(receivedChunks).sort((a, b) => a - b).map(i => receivedChunks[i]).join('');
+      const binary = Uint8Array.from(atob(data), c => c.charCodeAt(0));
+      const blob = new Blob([binary], { type: filetype });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+      document.getElementById('recvInfo').textContent = "Empfang abgeschlossen! Datei heruntergeladen.";
+    }
+  </script>
+</body>
+</html>
